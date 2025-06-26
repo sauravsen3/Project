@@ -5,6 +5,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report
+import warnings
+
+# Suppress specific sklearn warnings to keep the output clean
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # --- Data Loading from Yahoo Finance ---
 @st.cache_data # Cache data loading for performance in Streamlit
@@ -12,7 +20,7 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
     """
     Fetches historical OHLCV data for a list of ticker symbols (from multiselect)
     and a single custom ticker symbol, calculates daily returns for each,
-    and prepares data for correlation.
+    and prepares data for correlation and ML.
     """
     all_tickers_to_process = list(ticker_symbols_list) # Start with multiselect tickers
 
@@ -20,8 +28,13 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
     if custom_ticker_symbol and custom_ticker_symbol.strip() and custom_ticker_symbol.strip().upper() not in [t.split('(')[-1].replace(')','').strip() for t in all_tickers_to_process]:
         all_tickers_to_process.append(custom_ticker_symbol.strip().upper())
     
+    # If after adding custom ticker, we have more than 5, truncate for processing
+    if len(all_tickers_to_process) > 5:
+        st.warning("Limiting analysis to the first 5 selected/entered assets for consistency.")
+        all_tickers_to_process = all_tickers_to_process[:5]
+
     if not all_tickers_to_process:
-        return None, None # Return empty if no tickers selected or entered
+        return None, None, None # Return empty if no tickers selected or entered
 
     all_returns = pd.DataFrame()
     raw_data_for_first_ticker = None # To keep individual feature analysis for the first selected ticker
@@ -61,7 +74,6 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
             # Ensure 'Adj Close' column exists
             if 'Adj Close' not in data.columns:
                 if 'Close' in data.columns:
-                    # st.warning(f"'Adj Close' not found for {actual_ticker}. Using 'Close' price for calculations.")
                     data['Adj Close'] = data['Close']
                 else:
                     st.warning(f"Neither 'Adj Close' nor 'Close' found for {actual_ticker}. Skipping.")
@@ -75,10 +87,27 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
             # This applies to the first ticker in the combined list (selected or custom)
             if i == 0:
                 raw_data_for_first_ticker = data.copy()
-                raw_data_for_first_ticker['Daily_Return'] = raw_data_for_first_ticker['Adj Close'].pct_change()
-                raw_data_for_first_ticker['Daily_Volatility'] = raw_data_for_first_ticker['Daily_Return'].rolling(window=5).std()
-                raw_data_for_first_ticker['Volume_Change'] = raw_data_for_first_ticker['Volume'].pct_change()
-                raw_data_for_first_ticker['Simulated_Directional_Pressure'] = (raw_data_for_first_ticker['Close'] - raw_data_for_first_ticker['Open']) / raw_data_for_first_ticker['Open']
+                # Ensure these columns exist before operations
+                if 'Adj Close' in raw_data_for_first_ticker.columns:
+                    raw_data_for_first_ticker['Daily_Return'] = raw_data_for_first_ticker['Adj Close'].pct_change()
+                else:
+                    raw_data_for_first_ticker['Daily_Return'] = np.nan # Placeholder
+
+                if 'Daily_Return' in raw_data_for_first_ticker.columns:
+                    raw_data_for_first_ticker['Daily_Volatility'] = raw_data_for_first_ticker['Daily_Return'].rolling(window=5).std()
+                else:
+                    raw_data_for_first_ticker['Daily_Volatility'] = np.nan
+
+                if 'Volume' in raw_data_for_first_ticker.columns:
+                    raw_data_for_first_ticker['Volume_Change'] = raw_data_for_first_ticker['Volume'].pct_change()
+                else:
+                    raw_data_for_first_ticker['Volume_Change'] = np.nan
+
+                if 'Close' in raw_data_for_first_ticker.columns and 'Open' in raw_data_for_first_ticker.columns:
+                    raw_data_for_first_ticker['Simulated_Directional_Pressure'] = (raw_data_for_first_ticker['Close'] - raw_data_for_first_ticker['Open']) / raw_data_for_first_ticker['Open']
+                else:
+                    raw_data_for_first_ticker['Simulated_Directional_Pressure'] = np.nan
+
                 raw_data_for_first_ticker = raw_data_for_first_ticker.dropna()
 
         except Exception as e:
@@ -87,7 +116,7 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
 
     if all_returns.empty:
         st.error("No valid data could be loaded for any of the selected or entered assets. Please try different selections.")
-        return None, None
+        return None, None, None # Return None for all outputs
 
     # Calculate portfolio correlation matrix
     portfolio_corr_matrix = all_returns.corr()
@@ -113,7 +142,79 @@ def load_yahoo_data_for_portfolio(ticker_symbols_list, custom_ticker_symbol, sta
             'binned_feature_impact': binned_impact
         }
 
-    return portfolio_corr_matrix, individual_asset_features_data
+    return portfolio_corr_matrix, individual_asset_features_data, all_returns # Return all_returns for ML
+
+
+# --- Machine Learning Model ---
+@st.cache_data
+def predict_portfolio_outcome(all_returns_df):
+    """
+    Trains a simple Logistic Regression model to predict portfolio daily direction.
+    Features: Lagged portfolio daily return, lagged portfolio volatility.
+    Target: Binary (1 if next day's portfolio return is positive, 0 otherwise).
+    """
+    if all_returns_df is None or all_returns_df.empty:
+        return None, "Not enough data for prediction."
+
+    # Calculate simple average portfolio daily return (assuming equal weights for simplicity)
+    portfolio_returns = all_returns_df.mean(axis=1).dropna()
+
+    if len(portfolio_returns) < 100: # Need sufficient data points for meaningful training
+        return None, "Not enough historical data for robust prediction (need at least 100 data points)."
+
+    # Create target variable: 1 if next day's return is positive, 0 otherwise
+    # Shift returns by -1 to get the 'next day's return' as the target
+    portfolio_returns_future = portfolio_returns.shift(-1)
+    
+    # Create features: Lagged portfolio return and lagged portfolio volatility
+    features_df = pd.DataFrame({
+        'Lag_Return_1d': portfolio_returns.shift(1),
+        'Lag_Return_5d_MA': portfolio_returns.rolling(window=5).mean().shift(1),
+        'Lag_Volatility_5d': portfolio_returns.rolling(window=5).std().shift(1)
+    })
+
+    # Combine features and target, then drop NaNs created by shifting/rolling
+    ml_data = pd.DataFrame({'Target': (portfolio_returns_future > 0).astype(int)})
+    ml_data = pd.concat([ml_data, features_df], axis=1).dropna()
+
+    if ml_data.empty:
+        return None, "Not enough data after feature engineering and NaN removal for prediction."
+
+    X = ml_data[['Lag_Return_1d', 'Lag_Return_5d_MA', 'Lag_Volatility_5d']]
+    y = ml_data['Target']
+
+    if len(X) < 50: # Minimum data points for train/test split
+         return None, f"Insufficient data ({len(X)} points) for robust ML model training. Need at least 50."
+
+    # Check for target class distribution
+    if y.nunique() < 2:
+        return None, "Target variable has only one unique class (e.g., all up days or all down days). Cannot train a classifier."
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    # Check for class imbalance in training data to avoid errors if a class is missing in the split
+    if y_train.nunique() < 2:
+        return None, "Training data contains only one class for the target after splitting. Cannot train a classifier."
+    
+    model = LogisticRegression(random_state=42, solver='liblinear') # 'liblinear' is good for small datasets
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    # Predict the most likely direction for the "next" available day
+    # Use the last available data point's features to predict the immediate future
+    if not X.empty:
+        last_features = X.iloc[[-1]] # Get the last row of features
+        future_prediction_proba = model.predict_proba(last_features)[0]
+        future_prediction_class = model.predict(last_features)[0]
+        
+        outcome_text = f"**Predicted Portfolio Direction for Next Day:** {'UP (Positive Return)' if future_prediction_class == 1 else 'DOWN (Negative/Zero Return)'}"
+        confidence_text = f"**Confidence (UP vs. DOWN):** {future_prediction_proba[1]:.2f} (UP) vs {future_prediction_proba[0]:.2f} (DOWN)"
+        
+        return accuracy, outcome_text, confidence_text
+    
+    return accuracy, "Could not make a future prediction due to data issues."
 
 
 # --- Streamlit App Layout ---
@@ -151,8 +252,11 @@ custom_ticker = st.sidebar.text_input(
     "Or enter a custom Yahoo Finance Ticker (e.g., TSLA, BTC-USD):",
     value=""
 )
+# Ensure custom ticker doesn't exceed total 5 selected
 if custom_ticker and custom_ticker.strip().upper() in [t.split('(')[-1].replace(')','').strip() for t in selected_tickers]:
     st.sidebar.warning("Custom ticker already selected in the list above.")
+elif custom_ticker and (len(selected_tickers) + 1 > 5):
+     st.sidebar.warning(f"Adding '{custom_ticker.upper()}' would exceed the 5-asset limit. Please deselect an asset if you wish to add this one.")
 
 
 # Date inputs
@@ -183,13 +287,13 @@ st.header("Portfolio Diversification & Individual Asset Insights")
 st.markdown("---")
 
 # Pass both selected and custom tickers to the data loading function
-portfolio_corr_matrix, individual_asset_features_data = load_yahoo_data_for_portfolio(
+portfolio_corr_matrix, individual_asset_features_data, all_asset_daily_returns = load_yahoo_data_for_portfolio(
     selected_tickers, custom_ticker, start_date_str, end_date_str
 )
 
 if portfolio_corr_matrix is not None:
     # --- Tabbed Interface for Different Views ---
-    tab1, tab2, tab3, tab4 = st.tabs(["Portfolio Correlations", "Individual Asset Features", "Feature Impact", "Risk-Adjusted Insights"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Portfolio Correlations", "Individual Asset Features", "Feature Impact", "Risk-Adjusted Insights", "ML Portfolio Outcome"])
 
     with tab1:
         st.subheader("Inter-Asset Correlation Heatmap (Daily Returns)")
@@ -216,9 +320,9 @@ if portfolio_corr_matrix is not None:
         st.info("For diversification, you generally seek assets with low positive or negative correlations.")
 
     # Individual Asset Analysis tabs (now conditional on having data for at least one asset)
-    if individual_asset_features_data and selected_tickers: # Ensure a selected ticker for individual analysis
-        # Get the display name of the first selected ticker for these tabs
-        first_selected_ticker_display = selected_tickers[0]
+    if individual_asset_features_data and (selected_tickers or custom_ticker): # Ensure a selected/entered ticker for individual analysis
+        # Get the display name of the first selected/entered ticker for these tabs
+        first_selected_ticker_display = selected_tickers[0] if selected_tickers else custom_ticker.upper()
         
         with tab2:
             st.subheader(f"Feature Correlation Heatmap for {first_selected_ticker_display}")
@@ -314,7 +418,36 @@ if portfolio_corr_matrix is not None:
             )
     else:
         st.info("Select at least one asset to see individual asset features and insights. If you entered a custom ticker, it will be the primary asset if no multi-selected tickers are chosen.")
+    
+    with tab5:
+        st.subheader("Machine Learning Prediction: Portfolio Daily Direction")
+        st.write(
+            "This section attempts to predict the daily direction (up or down) of the "
+            "portfolio's average return using a simple machine learning model (Logistic Regression). "
+            "**Note: This is for demonstration purposes only and should NOT be used for actual investment decisions.** "
+            "Financial market prediction is highly complex, and this simplified model is not robust enough for real-world use."
+        )
 
+        if all_asset_daily_returns is not None and not all_asset_daily_returns.empty and len(all_asset_daily_returns.columns) > 0:
+            accuracy, outcome_text, confidence_text = predict_portfolio_outcome(all_asset_daily_returns)
+            if accuracy is not None:
+                st.write(f"**Model Accuracy (on test data):** {accuracy:.2%}")
+                st.write(outcome_text)
+                st.write(confidence_text)
+                st.markdown("---")
+                st.info(
+                    "**How it works:** The model uses historical lagged daily returns and volatility of the portfolio "
+                    "to predict if the *next* day's average portfolio return will be positive (UP) or negative/zero (DOWN)."
+                )
+                st.warning(
+                    "**Disclaimer:** This is a basic example. Real-world predictive models require vast amounts of data, "
+                    "sophisticated feature engineering, advanced algorithms, and rigorous backtesting to be potentially effective. "
+                    "Past performance is not indicative of future results."
+                )
+            else:
+                st.warning(outcome_text) # Display the reason for not being able to predict
+        else:
+            st.warning("Please select or enter at least one asset with sufficient historical data to run the ML prediction.")
 
 else:
     st.error("Please select or enter at least one asset to begin analysis.")
