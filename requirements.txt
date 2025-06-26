@@ -6,3 +6,4 @@ matplotlib
 yfinance
 altair
 gitdb
+scikit-learn
