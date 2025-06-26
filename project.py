@@ -1,48 +1,59 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jun 26 20:40:56 2025
-
-@author: sauravsen
-"""
-
 import streamlit as st
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
-import yfinance as yf # Import yfinance
+import yfinance as yf
+from datetime import datetime, timedelta # Import datetime for date handling
 
 # --- Data Loading from Yahoo Finance ---
 @st.cache_data # Cache data loading for performance in Streamlit
-def load_yahoo_data(ticker_symbol, period='1y', interval='1d'):
+def load_yahoo_data(ticker_symbol, start_date_str=None, end_date_str=None): # Changed arguments
     """
-    Fetches historical OHLCV data from Yahoo Finance for the given ticker.
-    Adjust period and interval as needed.
+    Fetches historical OHLCV data from Yahoo Finance for the given ticker
+    using start and end dates for robustness.
     """
+    yf_ticker_map = {
+        'EUR/USD': 'EURUSD=X', # Common FX format
+        'GBP/USD': 'GBPUSD=X',
+        'SPY (S&P 500 ETF)': 'SPY', # Example stock/ETF
+        'QQQ (Nasdaq 100 ETF)': 'QQQ' # Example stock/ETF
+    }
+    
+    actual_ticker = yf_ticker_map.get(ticker_symbol, ticker_symbol)
+
+    # Define default start/end dates if not provided
+    if end_date_str is None:
+        end_date = datetime.now()
+    else:
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d') # Assuming YYYY-MM-DD format
+
+    if start_date_str is None:
+        # Default to 1 year ago for FX, or adjust as needed
+        # Yahoo Finance FX data might not go back as far for some intervals.
+        start_date = end_date - timedelta(days=365) # Fetching roughly 1 year of data
+    else:
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+
+
     try:
-        # yfinance often uses a '.FX' suffix for currency pairs on some platforms,
-        # but for direct FX data (like EURUSD=X), it's typically direct.
-        # However, for plotting purposes, we'll simplify to common stock/index symbols
-        # or common FX symbols if they work directly.
-        # For true FX, you might need 'EURUSD=X', 'GBPUSD=X', 'JPY=X', etc.
-        # For simplicity and broader data availability on Yahoo, I'll use index proxies like SPY, QQQ.
-        # You can replace with 'EURUSD=X' if you verify it works consistently for your needs.
+        # Pass start and end dates instead of period
+        data = yf.download(actual_ticker, start=start_date, end=end_date, interval='1d')
         
-        # Mapping for display vs actual Yahoo Finance symbol
-        yf_ticker_map = {
-            'EUR/USD': 'EURUSD=X', # Common FX format
-            'GBP/USD': 'GBPUSD=X',
-            'SPY (S&P 500 ETF)': 'SPY', # Example stock/ETF
-            'QQQ (Nasdaq 100 ETF)': 'QQQ' # Example stock/ETF
-        }
-        
-        actual_ticker = yf_ticker_map.get(ticker_symbol, ticker_symbol)
-        
-        data = yf.download(actual_ticker, period=period, interval=interval)
         if data.empty:
-            st.error(f"No data found for {actual_ticker}. Please check the ticker symbol or try a different period/interval.")
+            st.error(f"No data found for {actual_ticker} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}. "
+                     "Please check the ticker symbol, dates, or try a different asset.")
             return None
+        
+        # Ensure 'Adj Close' column exists for consistent processing
+        if 'Adj Close' not in data.columns:
+            # Fallback if 'Adj Close' is truly missing for some rare ticker, use 'Close'
+            if 'Close' in data.columns:
+                st.warning(f"'Adj Close' not found for {actual_ticker}. Using 'Close' price for calculations.")
+                data['Adj Close'] = data['Close']
+            else:
+                st.error(f"Neither 'Adj Close' nor 'Close' column found for {actual_ticker}. Cannot proceed with calculations. Available columns: {data.columns.tolist()}")
+                return None
         
         # Calculate some basic daily features
         data['Daily_Return'] = data['Adj Close'].pct_change()
@@ -61,8 +72,6 @@ def load_yahoo_data(ticker_symbol, period='1y', interval='1d'):
         corr_matrix = features_for_corr.corr()
         
         # Simulate "binned impact" for a generic feature vs. return
-        # In a real scenario, this would be from a more complex analysis
-        # Here, we'll just bin 'Simulated_Directional_Pressure' and see average returns
         bins = pd.cut(data['Simulated_Directional_Pressure'], bins=5, labels=False)
         binned_impact = data.groupby(bins)['Daily_Return'].mean().reset_index()
         binned_impact.columns = ['Pressure_Bin', 'Avg_Future_Impact']
@@ -73,10 +82,11 @@ def load_yahoo_data(ticker_symbol, period='1y', interval='1d'):
             'binned_feature_impact': binned_impact
         }
     except Exception as e:
-        st.error(f"Error fetching data from Yahoo Finance for {ticker_symbol}: {e}")
+        st.error(f"An unexpected error occurred while fetching or processing data for {ticker_symbol}: {e}")
         return None
 
-# --- Streamlit App Layout ---
+
+# --- Streamlit App Layout (Adjust sidebar to use data_period selection) ---
 st.set_page_config(layout="wide", page_title="Market Data Insights Dashboard")
 
 st.title("Market Data Insights Dashboard (Powered by Yahoo Finance)")
@@ -92,14 +102,21 @@ st.markdown(
 st.sidebar.header("Configuration")
 selected_ticker = st.sidebar.selectbox(
     "Select Asset:",
-    ('EUR/USD', 'GBP/USD', 'SPY (S&P 500 ETF)', 'QQQ (Nasdaq 100 ETF)') # Added common ETFs as alternatives
+    ('EUR/USD', 'GBP/USD', 'SPY (S&P 500 ETF)', 'QQQ (Nasdaq 100 ETF)') # Keep options broad
 )
 
-data_period = st.sidebar.selectbox(
-    "Data Period:",
-    ('1y', '6mo', '3mo', '1mo'), # Common periods for daily data
-    index=0
-)
+# Use date inputs for more robust period control
+st.sidebar.markdown("### Date Range")
+default_end_date = datetime.now()
+default_start_date = default_end_date - timedelta(days=365) # 1 year ago
+
+start_date_input = st.sidebar.date_input("Start Date", default_start_date)
+end_date_input = st.sidebar.date_input("End Date", default_end_date)
+
+# Convert date objects to strings for the function
+start_date_str = start_date_input.strftime('%Y-%m-%d')
+end_date_str = end_date_input.strftime('%Y-%m-%d')
+
 
 st.sidebar.markdown("---") # Separator
 risk_appetite = st.sidebar.select_slider(
@@ -115,7 +132,8 @@ st.sidebar.info(
 st.header(f"Analysis for **{selected_ticker}**")
 st.markdown("---")
 
-data_store = load_yahoo_data(selected_ticker, period=data_period)
+# Call the data loading function with start/end dates
+data_store = load_yahoo_data(selected_ticker, start_date_str=start_date_str, end_date_str=end_date_str)
 
 if data_store:
     corr_matrix = data_store['corr_matrix']
