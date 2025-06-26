@@ -152,15 +152,16 @@ def predict_portfolio_outcome(all_returns_df):
     Trains a simple Logistic Regression model to predict portfolio daily direction.
     Features: Lagged portfolio daily return, lagged portfolio volatility.
     Target: Binary (1 if next day's portfolio return is positive, 0 otherwise).
+    Returns: accuracy, prediction_text, confidence_text, model, X_test, y_test, portfolio_returns_series
     """
     if all_returns_df is None or all_returns_df.empty:
-        return None, "Not enough data for prediction."
+        return None, "Not enough data for prediction.", None, None, None, None, None
 
     # Calculate simple average portfolio daily return (assuming equal weights for simplicity)
     portfolio_returns = all_returns_df.mean(axis=1).dropna()
 
     if len(portfolio_returns) < 100: # Need sufficient data points for meaningful training
-        return None, "Not enough historical data for robust prediction (need at least 100 data points)."
+        return None, "Not enough historical data for robust prediction (need at least 100 data points).", None, None, None, None, None
 
     # Create target variable: 1 if next day's return is positive, 0 otherwise
     # Shift returns by -1 to get the 'next day's return' as the target
@@ -178,23 +179,23 @@ def predict_portfolio_outcome(all_returns_df):
     ml_data = pd.concat([ml_data, features_df], axis=1).dropna()
 
     if ml_data.empty:
-        return None, "Not enough data after feature engineering and NaN removal for prediction."
+        return None, "Not enough data after feature engineering and NaN removal for prediction.", None, None, None, None, None
 
     X = ml_data[['Lag_Return_1d', 'Lag_Return_5d_MA', 'Lag_Volatility_5d']]
     y = ml_data['Target']
 
     if len(X) < 50: # Minimum data points for train/test split
-         return None, f"Insufficient data ({len(X)} points) for robust ML model training. Need at least 50."
+         return None, f"Insufficient data ({len(X)} points) for robust ML model training. Need at least 50.", None, None, None, None, None
 
     # Check for target class distribution
     if y.nunique() < 2:
-        return None, "Target variable has only one unique class (e.g., all up days or all down days). Cannot train a classifier."
+        return None, "Target variable has only one unique class (e.g., all up days or all down days). Cannot train a classifier.", None, None, None, None, None
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
     # Check for class imbalance in training data to avoid errors if a class is missing in the split
     if y_train.nunique() < 2:
-        return None, "Training data contains only one class for the target after splitting. Cannot train a classifier."
+        return None, "Training data contains only one class for the target after splitting. Cannot train a classifier.", None, None, None, None, None
     
     model = LogisticRegression(random_state=42, solver='liblinear') # 'liblinear' is good for small datasets
     model.fit(X_train, y_train)
@@ -212,9 +213,9 @@ def predict_portfolio_outcome(all_returns_df):
         outcome_text = f"**Predicted Portfolio Direction for Next Day:** {'UP (Positive Return)' if future_prediction_class == 1 else 'DOWN (Negative/Zero Return)'}"
         confidence_text = f"**Confidence (UP vs. DOWN):** {future_prediction_proba[1]:.2f} (UP) vs {future_prediction_proba[0]:.2f} (DOWN)"
         
-        return accuracy, outcome_text, confidence_text
+        return accuracy, outcome_text, confidence_text, model, X_test, y_test, portfolio_returns
     
-    return accuracy, "Could not make a future prediction due to data issues."
+    return accuracy, "Could not make a future prediction due to data issues.", None, None, None, None, None
 
 
 # --- Streamlit App Layout ---
@@ -255,7 +256,7 @@ custom_ticker = st.sidebar.text_input(
 # Ensure custom ticker doesn't exceed total 5 selected
 if custom_ticker and custom_ticker.strip().upper() in [t.split('(')[-1].replace(')','').strip() for t in selected_tickers]:
     st.sidebar.warning("Custom ticker already selected in the list above.")
-elif custom_ticker and (len(selected_tickers) + 1 > 5):
+elif custom_ticker and (len(selected_tickers) >= 5): # Changed from > to >= to enforce strict 5 limit with custom
      st.sidebar.warning(f"Adding '{custom_ticker.upper()}' would exceed the 5-asset limit. Please deselect an asset if you wish to add this one.")
 
 
@@ -320,10 +321,18 @@ if portfolio_corr_matrix is not None:
         st.info("For diversification, you generally seek assets with low positive or negative correlations.")
 
     # Individual Asset Analysis tabs (now conditional on having data for at least one asset)
-    if individual_asset_features_data and (selected_tickers or custom_ticker): # Ensure a selected/entered ticker for individual analysis
+    if individual_asset_features_data and (selected_tickers or (custom_ticker and custom_ticker.strip())): # Ensure a selected/entered ticker for individual analysis
         # Get the display name of the first selected/entered ticker for these tabs
-        first_selected_ticker_display = selected_tickers[0] if selected_tickers else custom_ticker.upper()
+        # This logic needs to be careful: if custom is first processed and selected_tickers is empty, it should be custom
+        # If selected_tickers has values, it should be the first one from there.
+        active_tickers_list = list(selected_tickers)
+        if custom_ticker and custom_ticker.strip():
+            # Add custom_ticker to a temporary list to determine the 'first' ticker, avoiding duplicates
+            if custom_ticker.strip().upper() not in [t.split('(')[-1].replace(')','').strip() for t in selected_tickers]:
+                 active_tickers_list.append(custom_ticker.strip().upper())
         
+        first_selected_ticker_display = active_tickers_list[0] if active_tickers_list else "Selected Asset"
+
         with tab2:
             st.subheader(f"Feature Correlation Heatmap for {first_selected_ticker_display}")
             st.write(
@@ -428,27 +437,107 @@ if portfolio_corr_matrix is not None:
             "Financial market prediction is highly complex, and this simplified model is not robust enough for real-world use."
         )
 
-        if all_asset_daily_returns is not None and not all_asset_daily_returns.empty and len(all_asset_daily_returns.columns) > 0:
-            accuracy, outcome_text, confidence_text = predict_portfolio_outcome(all_asset_daily_returns)
-            if accuracy is not None:
-                st.write(f"**Model Accuracy (on test data):** {accuracy:.2%}")
-                st.write(outcome_text)
-                st.write(confidence_text)
-                st.markdown("---")
-                st.info(
-                    "**How it works:** The model uses historical lagged daily returns and volatility of the portfolio "
-                    "to predict if the *next* day's average portfolio return will be positive (UP) or negative/zero (DOWN)."
-                )
-                st.warning(
-                    "**Disclaimer:** This is a basic example. Real-world predictive models require vast amounts of data, "
-                    "sophisticated feature engineering, advanced algorithms, and rigorous backtesting to be potentially effective. "
-                    "Past performance is not indicative of future results."
-                )
-            else:
-                st.warning(outcome_text) # Display the reason for not being able to predict
-        else:
-            st.warning("Please select or enter at least one asset with sufficient historical data to run the ML prediction.")
+        accuracy, outcome_text, confidence_text, model, X_test, y_test, portfolio_returns_series = predict_portfolio_outcome(all_asset_daily_returns)
+        
+        if accuracy is not None:
+            st.write(f"**Model Accuracy (on test data):** {accuracy:.2%}")
+            st.write(outcome_text)
+            st.write(confidence_text)
+            st.markdown("---")
+            
+            # Plotting model insights
+            st.subheader("Model Insights & Visualization")
+            
+            # Plot 1: Feature Coefficients
+            if model is not None and hasattr(model, 'coef_') and len(model.coef_[0]) == len(X_test.columns):
+                coefficients = pd.DataFrame({
+                    'Feature': X_test.columns,
+                    'Coefficient': model.coef_[0]
+                }).sort_values(by='Coefficient', ascending=False)
 
+                fig_coef, ax_coef = plt.subplots(figsize=(10, 6))
+                sns.barplot(x='Coefficient', y='Feature', data=coefficients, palette='viridis', ax=ax_coef)
+                ax_coef.set_title("Logistic Regression Feature Coefficients", fontsize=16)
+                ax_coef.set_xlabel("Coefficient Value")
+                ax_coef.set_ylabel("Feature")
+                st.pyplot(fig_coef)
+                plt.close(fig_coef)
+                st.markdown(
+                    "**Interpreting Coefficients:** Positive coefficients suggest that an increase in the feature value "
+                    "increases the likelihood of an 'UP' day, and vice-versa for negative coefficients. "
+                    "The magnitude indicates the strength of this relationship."
+                )
+                st.markdown("---")
+
+            # Plot 2: Predicted Probabilities of UP Day vs. Actual Portfolio Returns
+            if portfolio_returns_series is not None and not portfolio_returns_series.empty and model is not None and X_test is not None:
+                # Use the full data for plotting probabilities, not just test set
+                # Re-calculate features for the full portfolio_returns_series
+                full_features_df = pd.DataFrame({
+                    'Lag_Return_1d': portfolio_returns_series.shift(1),
+                    'Lag_Return_5d_MA': portfolio_returns_series.rolling(window=5).mean().shift(1),
+                    'Lag_Volatility_5d': portfolio_returns_series.rolling(window=5).std().shift(1)
+                }).dropna()
+
+                if not full_features_df.empty:
+                    # Predict probabilities for the entire data used for features
+                    predicted_probabilities = model.predict_proba(full_features_df)[:, 1] # Probability of class 1 (UP)
+                    
+                    plot_data = pd.DataFrame({
+                        'Date': full_features_df.index,
+                        'Predicted_Prob_UP': predicted_probabilities
+                    })
+                    # Merge with actual portfolio returns on Date
+                    plot_data = plot_data.set_index('Date').join(portfolio_returns_series.rename('Actual_Portfolio_Return'))
+                    plot_data = plot_data.dropna()
+
+                    if not plot_data.empty:
+                        fig_prob, ax_prob1 = plt.subplots(figsize=(12, 7))
+
+                        # Plot Predicted Probability of UP
+                        ax_prob1.plot(plot_data.index, plot_data['Predicted_Prob_UP'], color='purple', label='Predicted Probability of UP Day', alpha=0.7)
+                        ax_prob1.set_xlabel("Date")
+                        ax_prob1.set_ylabel("Predicted Probability (UP)", color='purple')
+                        ax_prob1.tick_params(axis='y', labelcolor='purple')
+                        ax_prob1.set_title("Predicted Probability of UP Day vs. Actual Portfolio Returns", fontsize=16)
+                        ax_prob1.grid(True, linestyle='--', alpha=0.6)
+                        ax_prob1.legend(loc="upper left")
+
+                        # Create a second y-axis for Actual Portfolio Returns
+                        ax_prob2 = ax_prob1.twinx()
+                        ax_prob2.plot(plot_data.index, plot_data['Actual_Portfolio_Return'], color='green', label='Actual Daily Portfolio Return', alpha=0.5, linestyle='--')
+                        ax_prob2.set_ylabel("Actual Daily Portfolio Return", color='green')
+                        ax_prob2.tick_params(axis='y', labelcolor='green')
+                        ax_prob2.legend(loc="upper right")
+
+                        plt.tight_layout()
+                        st.pyplot(fig_prob)
+                        plt.close(fig_prob)
+
+                        st.markdown(
+                            "**Interpreting Probability Plot:** This graph shows how the model's predicted probability of "
+                            "an 'UP' day (purple line) fluctuates over time, overlaid with the actual daily portfolio returns (green dashed line). "
+                            "When the purple line is high, the model predicts a higher chance of a positive return."
+                        )
+                    else:
+                        st.warning("Not enough data to plot predicted probabilities vs. actual returns after alignment.")
+                else:
+                    st.warning("Could not generate features for plotting probabilities. Check date range or data availability.")
+            else:
+                st.warning("Could not generate probability plot. Ensure sufficient data and a trained model are available.")
+
+            st.markdown("---")
+            st.info(
+                "**How it works:** The model uses historical lagged daily returns and volatility of the portfolio "
+                "to predict if the *next* day's average portfolio return will be positive (UP) or negative/zero (DOWN)."
+            )
+            st.warning(
+                "**Disclaimer:** This is a basic example. Real-world predictive models require vast amounts of data, "
+                "sophisticated feature engineering, advanced algorithms, and rigorous backtesting to be potentially effective. "
+                "Past performance is not indicative of future results."
+            )
+        else:
+            st.warning(outcome_text) # Display the reason for not being able to predict
 else:
     st.error("Please select or enter at least one asset to begin analysis.")
 
